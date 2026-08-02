@@ -9,7 +9,7 @@ use collections::HashMap;
 use gpui_util::ResultExt as _;
 use image::RgbaImage;
 use parking_lot::Mutex;
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use std::{
     path::PathBuf,
     rc::{Rc, Weak},
@@ -46,18 +46,17 @@ pub(crate) struct TestWindowState {
 pub struct TestWindow(pub(crate) Rc<Mutex<TestWindowState>>);
 
 impl HasWindowHandle for TestWindow {
-    fn window_handle(
-        &self,
-    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        unimplemented!("Test Windows are not backed by a real platform window")
+    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, HandleError> {
+        // Test windows have no native platform handle. Report that absence through
+        // the raw-window-handle contract so optional platform integrations can
+        // gracefully skip themselves in integration tests.
+        Err(HandleError::NotSupported)
     }
 }
 
 impl HasDisplayHandle for TestWindow {
-    fn display_handle(
-        &self,
-    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        unimplemented!("Test Windows are not backed by a real platform window")
+    fn display_handle(&self) -> Result<raw_window_handle::DisplayHandle<'_>, HandleError> {
+        Err(HandleError::NotSupported)
     }
 }
 
@@ -452,5 +451,27 @@ impl PlatformAtlas for TestAtlas {
 
     fn contains(&self, key: &AtlasKey) -> bool {
         self.0.lock().tiles.contains_key(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use raw_window_handle::{HandleError, HasDisplayHandle as _, HasWindowHandle as _};
+
+    use crate::{Empty, TestAppContext};
+
+    #[gpui::test]
+    fn raw_handles_report_not_supported(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let test_window = cx.test_window(window.into());
+
+        assert!(matches!(
+            test_window.window_handle(),
+            Err(HandleError::NotSupported)
+        ));
+        assert!(matches!(
+            test_window.display_handle(),
+            Err(HandleError::NotSupported)
+        ));
     }
 }

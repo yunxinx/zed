@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use super::LineWrapper;
+use super::line_break;
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -140,7 +140,7 @@ impl LineLayout {
             glyph_ix: 0,
         };
         let mut last_boundary_x = px(0.);
-        let mut prev_ch = '\0';
+        let break_offsets = line_break::offsets(text).collect::<Vec<_>>();
         let mut glyphs = self
             .runs
             .iter()
@@ -150,6 +150,7 @@ impl LineLayout {
                     let character = text[glyph.index..].chars().next().unwrap();
                     (
                         WrapBoundary { run_ix, glyph_ix },
+                        glyph.index,
                         character,
                         glyph.position.x,
                     )
@@ -157,30 +158,22 @@ impl LineLayout {
             })
             .peekable();
 
-        while let Some((boundary, ch, x)) = glyphs.next() {
+        while let Some((boundary, byte_index, ch, x)) = glyphs.next() {
             if ch == '\n' {
                 continue;
             }
 
-            // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
-            // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
-            } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
+            if break_offsets.binary_search(&byte_index).is_ok() && first_non_whitespace_ix.is_some()
+            {
+                last_candidate_ix = Some(boundary);
+                last_candidate_x = x;
             }
 
             if ch != ' ' && first_non_whitespace_ix.is_none() {
                 first_non_whitespace_ix = Some(boundary);
             }
 
-            let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
+            let next_x = glyphs.peek().map_or(self.width, |(_, _, _, x)| *x);
             let width = next_x - last_boundary_x;
 
             if width > wrap_width && boundary > last_boundary {
@@ -200,7 +193,6 @@ impl LineLayout {
                 }
                 boundaries.push(last_boundary);
             }
-            prev_ch = ch;
         }
 
         boundaries
@@ -991,6 +983,29 @@ mod tests {
             .iter()
             .map(|g| f32::from(g.position.x))
             .collect()
+    }
+
+    #[test]
+    fn wrapping_does_not_leave_cjk_closing_punctuation_at_line_start() {
+        let text = "你好，世界";
+        let mut layout = make_layout(
+            text.char_indices()
+                .enumerate()
+                .map(|(glyph_ix, (byte_ix, _))| glyph_at(glyph_ix as f32 * 10., byte_ix))
+                .collect(),
+        );
+        layout.width = px(50.);
+
+        let boundaries = layout.compute_wrap_boundaries(text, px(21.), None);
+
+        assert_eq!(
+            boundaries.first(),
+            Some(&WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 1,
+            }),
+            "the second line should begin with 好 rather than ，"
+        );
     }
 
     #[test]
