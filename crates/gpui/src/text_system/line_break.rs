@@ -1,7 +1,16 @@
 use unicode_linebreak::BreakOpportunity;
 
+use super::LineWrapper;
+
 /// Returns every Unicode line-break opportunity as the byte index immediately
 /// after the preceding character.
+///
+/// GPUI's product-level word tailoring (`LineWrapper::is_word_char`) decides
+/// where a soft wrap is desirable; UAX #14 is then consulted as a veto whenever
+/// a non-ASCII, non-word character participates in the boundary so CJK,
+/// emoji, and punctuation clusters stay legal. Keeping one word table shared
+/// with `LineWrapper` means upstream tailoring changes flow into this policy
+/// without a second list to maintain.
 pub(crate) fn opportunities(text: &str) -> impl Iterator<Item = (usize, BreakOpportunity)> + '_ {
     let unicode_opportunities = unicode_linebreak::linebreaks(text).collect::<Vec<_>>();
     let mut tailored_opportunities = Vec::new();
@@ -9,7 +18,7 @@ pub(crate) fn opportunities(text: &str) -> impl Iterator<Item = (usize, BreakOpp
 
     for (offset, character) in text.char_indices() {
         let legacy_allowed = match previous {
-            Some(previous) if is_legacy_word_character(character) => previous == ' ',
+            Some(previous) if LineWrapper::is_word_char(character) => previous == ' ',
             Some(_) => character != ' ',
             None => false,
         };
@@ -45,48 +54,12 @@ pub(crate) fn offsets(text: &str) -> impl Iterator<Item = usize> + '_ {
     opportunities(text).map(|(offset, _)| offset)
 }
 
-/// GPUI historically kept these characters together as product-level words.
-/// Retaining that tailoring avoids introducing new wraps in identifiers, URLs,
-/// numbers, and scripts that were already handled as indivisible words.
-fn is_legacy_word_character(character: char) -> bool {
-    character.is_ascii_alphanumeric()
-        || matches!(character, '\u{00C0}'..='\u{00FF}')
-        || matches!(character, '\u{0100}'..='\u{017F}')
-        || matches!(character, '\u{0180}'..='\u{024F}')
-        || matches!(character, '\u{0400}'..='\u{04FF}')
-        || matches!(character, '\u{1E00}'..='\u{1EFF}')
-        || matches!(character, '\u{0300}'..='\u{036F}')
-        || matches!(character, '\u{0980}'..='\u{09FF}')
-        || matches!(
-            character,
-            '-' | '_'
-                | '.'
-                | '\''
-                | '’'
-                | '‘'
-                | '$'
-                | '%'
-                | '@'
-                | '#'
-                | '^'
-                | '~'
-                | ','
-                | '='
-                | ':'
-                | ';'
-                | '⋯'
-                | '\u{202F}'
-                | '\u{00A0}'
-                | '\u{2011}'
-        )
-}
-
 /// UAX #14 is used as a veto when non-ASCII, non-word content participates in
 /// a boundary. This fixes CJK/emoji punctuation and cluster rules while the
 /// existing ASCII product tailoring remains byte-for-byte compatible.
 fn requires_unicode_validation(previous: Option<char>, character: char) -> bool {
     fn is_unicode_sensitive(character: char) -> bool {
-        character != '\u{fffc}' && !character.is_ascii() && !is_legacy_word_character(character)
+        character != '\u{fffc}' && !character.is_ascii() && !LineWrapper::is_word_char(character)
     }
 
     previous.is_some_and(is_unicode_sensitive) || is_unicode_sensitive(character)
@@ -206,5 +179,36 @@ mod tests {
     #[test]
     fn preserves_non_breaking_glue_sequences() {
         assert!(allowed_offsets("a\u{202f}b\u{00a0}c\u{2011}d").is_empty());
+    }
+
+    #[test]
+    fn keeps_upstream_closing_punctuation_attached_to_the_preceding_word() {
+        // UAX #14 LB13 tailoring from `LineWrapper::is_word_char`: closing
+        // punctuation never starts a wrapped line.
+        for word in [
+            "plz!",
+            "see)",
+            "list]",
+            "block}",
+            "said\"",
+            "quoted”",
+            "quoted»",
+            "well…",
+            "foo)bar",
+            "x!y",
+        ] {
+            assert!(
+                allowed_offsets(word).is_empty(),
+                "closing punctuation unexpectedly wrapped: {word}"
+            );
+        }
+
+        // An opening quote after a space still starts a new word.
+        assert_eq!(
+            allowed_offsets("he said \"hi\""),
+            vec!["he ".len(), "he said ".len()]
+        );
+        // Slashes and question marks remain break opportunities for paths/URLs.
+        assert_eq!(allowed_offsets("a/b?c"), vec!["a".len(), "a/b".len()]);
     }
 }
