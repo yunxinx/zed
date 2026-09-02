@@ -501,7 +501,29 @@ impl ListState {
     /// Inform the list state that the items in `old_range` have been replaced
     /// by `count` new items that must be recalculated.
     pub fn splice(&self, old_range: Range<usize>, count: usize) {
-        self.splice_focusable(old_range, (0..count).map(|_| None))
+        self.splice_focusable_with_hint(old_range, (0..count).map(|_| None), None)
+    }
+
+    /// Inform the list state that the items in `old_range` have been replaced
+    /// by `count` new items and provide a bounded height estimate for them.
+    ///
+    /// The estimate is used until an item is measured. This keeps the
+    /// scrollbar useful for append-heavy virtual lists where treating every
+    /// unknown item as zero makes the thumb oscillate as content is discovered.
+    pub fn splice_with_uniform_height(
+        &self,
+        old_range: Range<usize>,
+        count: usize,
+        height: Pixels,
+    ) {
+        self.splice_focusable_with_hint(
+            old_range,
+            (0..count).map(|_| None),
+            Some(Size {
+                width: px(0.),
+                height,
+            }),
+        )
     }
 
     /// Register with the list state that the items in `old_range` have been replaced
@@ -512,6 +534,15 @@ impl ListState {
         &self,
         old_range: Range<usize>,
         focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
+    ) {
+        self.splice_focusable_with_hint(old_range, focus_handles, None)
+    }
+
+    fn splice_focusable_with_hint(
+        &self,
+        old_range: Range<usize>,
+        focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
+        size_hint: Option<Size<Pixels>>,
     ) {
         let state = &mut *self.0.borrow_mut();
 
@@ -524,7 +555,7 @@ impl ListState {
             focus_handles.into_iter().map(|focus_handle| {
                 spliced_count += 1;
                 ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint,
                     focus_handle,
                 }
             }),
@@ -1728,6 +1759,20 @@ mod test {
         IntoElement, ListState, Render, Styled, TestAppContext, Window, canvas, div, list, point,
         px, size,
     };
+
+    #[test]
+    fn splice_with_uniform_height_preserves_bounded_content_estimate() {
+        let state =
+            ListState::new(2, crate::ListAlignment::Top, px(0.)).with_uniform_item_height(px(10.));
+
+        state.splice_with_uniform_height(2..2, 3, px(12.));
+
+        let state = state.0.borrow();
+        let summary = state.items.summary();
+        assert_eq!(summary.count, 5);
+        assert_eq!(summary.height, px(56.));
+        assert!(!summary.has_unknown_height);
+    }
 
     #[gpui::test]
     fn test_autoscroll_above_item_top_renders_items_above(cx: &mut TestAppContext) {

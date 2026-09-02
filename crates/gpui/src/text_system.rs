@@ -1,6 +1,8 @@
 mod font_fallbacks;
 mod font_features;
 mod line;
+// Keep the Unicode line-breaking policy shared by all GPUI text paths.
+mod line_break;
 mod line_layout;
 mod line_wrapper;
 
@@ -334,6 +336,16 @@ impl TextSystem {
             wrapper: Some(wrapper),
             text_system: self.clone(),
         }
+    }
+
+    /// Returns GPUI's product-tailored Unicode soft-wrap opportunities.
+    ///
+    /// Each offset is a UTF-8 byte index at which the following line may begin.
+    /// Mandatory boundaries, including the end of the string, are included.
+    /// Consumers that mix text with atomic inline elements can use these
+    /// offsets while measuring the actual shaped text themselves.
+    pub fn line_break_offsets(&self, text: &str) -> Vec<usize> {
+        line_break::offsets(text).collect()
     }
 
     /// Get the rasterized size and location of a specific, rendered glyph.

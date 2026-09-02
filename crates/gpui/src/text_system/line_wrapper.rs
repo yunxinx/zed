@@ -2,6 +2,8 @@ use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, px};
 use collections::HashMap;
 use std::{borrow::Cow, iter, sync::Arc};
 
+use super::line_break;
+
 /// Determines whether to truncate text from the start or end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TruncateFrom {
@@ -48,8 +50,8 @@ impl LineWrapper {
         let mut last_candidate_ix = 0;
         let mut last_candidate_width = px(0.);
         let mut last_wrap_ix = 0;
-        let mut prev_c = '\0';
         let mut index = 0;
+        let break_offsets = line_break_offsets_for_fragments(fragments);
         let mut candidates = fragments
             .iter()
             .flat_map(move |fragment| fragment.wrap_boundary_candidates())
@@ -58,31 +60,20 @@ impl LineWrapper {
             for candidate in candidates.by_ref() {
                 let ix = index;
                 index += candidate.len_utf8();
-                let mut new_prev_c = prev_c;
+                if break_offsets.binary_search(&ix).is_ok() && first_non_whitespace_ix.is_some() {
+                    last_candidate_ix = ix;
+                    last_candidate_width = width;
+                }
+
                 let item_width = match candidate {
                     WrapBoundaryCandidate::Char { character: c } => {
                         if c == '\n' {
                             continue;
                         }
 
-                        if Self::is_word_char(c) {
-                            if prev_c == ' ' && c != ' ' && first_non_whitespace_ix.is_some() {
-                                last_candidate_ix = ix;
-                                last_candidate_width = width;
-                            }
-                        } else {
-                            // CJK may not be space separated, e.g.: `Hello world你好世界`
-                            if c != ' ' && first_non_whitespace_ix.is_some() {
-                                last_candidate_ix = ix;
-                                last_candidate_width = width;
-                            }
-                        }
-
                         if c != ' ' && first_non_whitespace_ix.is_none() {
                             first_non_whitespace_ix = Some(ix);
                         }
-
-                        new_prev_c = c;
 
                         self.width_for_char(c)
                     }
@@ -90,11 +81,6 @@ impl LineWrapper {
                         width: element_width,
                         ..
                     } => {
-                        if prev_c == ' ' && first_non_whitespace_ix.is_some() {
-                            last_candidate_ix = ix;
-                            last_candidate_width = width;
-                        }
-
                         if first_non_whitespace_ix.is_none() {
                             first_non_whitespace_ix = Some(ix);
                         }
@@ -127,8 +113,6 @@ impl LineWrapper {
 
                     return Some(Boundary::new(last_wrap_ix, indent.unwrap_or(0)));
                 }
-
-                prev_c = new_prev_c;
             }
 
             None
@@ -340,9 +324,9 @@ impl LineWrapper {
         let mut last_candidate_ix = 0usize;
         let mut last_candidate_width = px(0.);
         let mut last_wrap_ix = 0usize;
-        let mut prev_c = '\0';
         let mut indent: Option<u32> = None;
         let mut truncate_ix = 0usize;
+        let break_offsets = line_break::offsets(&text).collect::<Vec<_>>();
 
         for (ix, c) in text.char_indices() {
             if c == '\n' {
@@ -369,7 +353,6 @@ impl LineWrapper {
                 last_candidate_ix = 0;
                 last_candidate_width = px(0.);
                 last_wrap_ix = ix + 1;
-                prev_c = '\0';
                 indent = None;
                 truncate_ix = ix + 1;
                 continue;
@@ -377,12 +360,7 @@ impl LineWrapper {
 
             let char_width = self.width_for_char(c);
 
-            if Self::is_word_char(c) {
-                if prev_c == ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = ix;
-                    last_candidate_width = width;
-                }
-            } else if c != ' ' && first_non_whitespace_ix.is_some() {
+            if break_offsets.binary_search(&ix).is_ok() && first_non_whitespace_ix.is_some() {
                 last_candidate_ix = ix;
                 last_candidate_width = width;
             }
@@ -437,8 +415,6 @@ impl LineWrapper {
                     return (result, Cow::Owned(runs));
                 }
             }
-
-            prev_c = c;
         }
 
         // Text fits within max_lines without truncation.
@@ -653,6 +629,70 @@ impl<'a> LineFragment<'a> {
             }
         })
     }
+}
+
+fn line_break_offsets_for_fragments(fragments: &[LineFragment<'_>]) -> Vec<usize> {
+    let mut breaking_text = String::new();
+    let mut mapped_offsets = vec![(0, 0)];
+    let mut element_offsets = Vec::new();
+    let mut logical_offset = 0;
+    let mut previous_character = None;
+
+    let record_mapping =
+        |breaking_offset: usize, logical_offset: usize, mappings: &mut Vec<(usize, usize)>| {
+            if let Some((last_breaking_offset, last_logical_offset)) = mappings.last_mut()
+                && *last_breaking_offset == breaking_offset
+            {
+                *last_logical_offset = logical_offset;
+            } else {
+                mappings.push((breaking_offset, logical_offset));
+            }
+        };
+
+    for fragment in fragments {
+        match fragment {
+            LineFragment::Text { text } => {
+                if breaking_text.is_empty() && logical_offset > 0 && !text.is_empty() {
+                    // A leading element is transparent to GPUI's word
+                    // classification, but it is still real line content. Use
+                    // one object-replacement character only for the initial
+                    // Unicode boundary so CJK may wrap after the element while
+                    // closing punctuation still obeys UAX #14.
+                    breaking_text.push('\u{fffc}');
+                    record_mapping(breaking_text.len(), logical_offset, &mut mapped_offsets);
+                }
+                for character in text.chars() {
+                    breaking_text.push(character);
+                    logical_offset += character.len_utf8();
+                    previous_character = Some(character);
+                    record_mapping(breaking_text.len(), logical_offset, &mut mapped_offsets);
+                }
+            }
+            LineFragment::Element { len_utf8, .. } => {
+                // Preserve the original LineWrapper contract: an element is
+                // transparent to word classification, but a space immediately
+                // before it is also a valid boundary before the element.
+                if previous_character == Some(' ') {
+                    element_offsets.push(logical_offset);
+                }
+                logical_offset += len_utf8;
+                record_mapping(breaking_text.len(), logical_offset, &mut mapped_offsets);
+            }
+        }
+    }
+
+    let mut offsets = line_break::offsets(&breaking_text)
+        .filter_map(|breaking_offset| {
+            mapped_offsets
+                .binary_search_by_key(&breaking_offset, |(offset, _)| *offset)
+                .ok()
+                .map(|index| mapped_offsets[index].1)
+        })
+        .chain(element_offsets)
+        .collect::<Vec<_>>();
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
 }
 
 enum WrapBoundaryCandidate {
@@ -1200,6 +1240,53 @@ mod tests {
         assert_word("\u{202F}"); // NNBSP " "
         assert_word("\u{00A0}"); // NBSP " "
         assert_word("\u{2011}"); // NBH "‑"
+    }
+
+    #[test]
+    fn line_break_offsets_cross_fragments_and_preserve_element_lengths() {
+        let fragments = [
+            LineFragment::text("hello "),
+            LineFragment::text("world"),
+            LineFragment::element(px(10.), 4),
+        ];
+        let offsets = line_break_offsets_for_fragments(&fragments);
+
+        assert!(offsets.contains(&"hello ".len()));
+        assert_eq!(offsets.last(), Some(&("hello world".len() + 4)));
+    }
+
+    #[test]
+    fn line_break_offsets_preserve_legacy_element_tailoring() {
+        let spaced = [
+            LineFragment::text("aa "),
+            LineFragment::element(px(10.), 4),
+            LineFragment::text("word"),
+        ];
+        assert_eq!(line_break_offsets_for_fragments(&spaced), vec![3, 7, 11]);
+
+        let attached = [
+            LineFragment::text("aa"),
+            LineFragment::element(px(10.), 4),
+            LineFragment::text("word"),
+        ];
+        assert_eq!(line_break_offsets_for_fragments(&attached), vec![10]);
+
+        let cjk = [
+            LineFragment::text("你"),
+            LineFragment::element(px(10.), 4),
+            LineFragment::text("好"),
+        ];
+        assert_eq!(line_break_offsets_for_fragments(&cjk), vec![7, 10]);
+
+        let leading_cjk = [LineFragment::element(px(10.), 4), LineFragment::text("好")];
+        assert_eq!(line_break_offsets_for_fragments(&leading_cjk), vec![4, 7]);
+
+        let leading_closing_punctuation =
+            [LineFragment::element(px(10.), 4), LineFragment::text("）")];
+        assert_eq!(
+            line_break_offsets_for_fragments(&leading_closing_punctuation),
+            vec![7]
+        );
     }
 
     // For compatibility with the test macro
